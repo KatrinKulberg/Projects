@@ -6,4 +6,4 @@ The aim of this project is to develop different machine learning approaches for 
 
 ## Project
 
-The [full project report (PDF)](Weather%20Prediction%20Project.pdf).
+The full project report (PDF) is available [here](Weather%20Prediction%20Project.pdf).
