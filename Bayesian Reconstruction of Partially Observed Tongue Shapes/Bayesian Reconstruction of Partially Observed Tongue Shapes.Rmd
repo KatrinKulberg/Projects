@@ -1,0 +1,1572 @@
+---
+title: "Bayesian Reconstruction of Partially Observed Tongue Shapes"
+author: "Katrin Kulberg, Louis Arthur David Del Perugia, Salomé Olivier Moret, Maximilian Brunner, Cheikh Mourtada Mboup"
+date: "11.05.2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# libraries
+library(dplyr)
+library(tidyr)
+library(MASS)
+library(Matrix)
+library(ggplot2)
+library(ggforce) # (extra plotting features)
+library(ggpattern) # (extra plotting features)
+library(fitdistrplus)
+library(gridExtra)
+#library(grid) 
+
+# loading data (assuming the files are in the same folder as the Rmd file)
+load("speaker1_tongue_shapes.RData")
+load("speaker2_tongue_shapes.RData")
+```
+
+# Data Preprocessing
+
+This subsection takes care of the initial data processing, including creating dataframe objects for the data of both speakers, reordering the points of the second speaker, and creating the standardised coordinate ($\tau$) along the curve.
+
+```{r}
+# transforming data into a data frame shape
+# first speaker
+df1 <- data.frame(
+  x = as.vector(speaker1[,1,]),
+  y = as.vector(speaker1[,2,]),
+  t = rep(1:dim(speaker1)[1], times = dim(speaker1)[3]),     # point along the curve
+  shape = rep(1:dim(speaker1)[3], each = dim(speaker1)[1]),  # shape number
+  speaker = 1
+)
+
+# second speaker
+df2 <- data.frame(
+  x = as.vector(speaker2[,1,]),
+  y = as.vector(speaker2[,2,]),
+  t = rep(1:dim(speaker2)[1], times = dim(speaker2)[3]),     # point along the curve
+  shape = rep(1:dim(speaker2)[3], each = dim(speaker2)[1]),  # shape number
+  speaker = 2
+)
+
+# given that the curves of the second speaker appear to be indexed in an opposite order compared to the curves of the first speaker, we reorder the indices t for speaker 2
+df2$t <- 45 - df2$t + 1
+
+# however, given that the 5th shape was already in the right order, we reorder that particular shape again
+# additionally removing an outlier from shape 5
+df2 <- df2 %>%
+  mutate(t= ifelse(shape == 5, 45 - t + 1, t)) %>% 
+  filter(!(shape == 5 & t == 45)) # remove outlier
+
+
+# adding standardised index t (tau on the poster) to both data frames (this step allows to combine curves from speaker 1 and 2 in the later stage)
+# (multiplying by 1/(n+1)), where n is the number of data points
+df1$t_standardised <- df1$t / 66
+df2$t_standardised <- df2$t / 46
+
+# combining data frames of both speaker
+df <- rbind(df1, df2)
+```
+
+
+# General Function Definitions
+
+This subsection includes general functions that will be used in a later stage.
+
+```{r}
+
+# function that constructs the normalised shifted Legendre basis for input x and degree
+# function is only implemented up to degree 5, as it is the highest degree used in this project
+build_shifted_legendre_basis <- function(x, degree) {
+  
+  # binding column-wise
+  sapply(0:degree, function(n) {
+    
+    Pn <- if (n == 0) {
+      rep(1, length(x))
+      
+    } else if (n == 1) {
+      2*x - 1
+      
+    } else if (n == 2) {
+      6*x^2 - 6*x + 1
+      
+    } else if (n == 3) {
+      20*x^3 - 30*x^2 + 12*x - 1
+      
+    } else if (n == 4) {
+      70*x^4 - 140*x^3 + 90*x^2 - 20*x + 1
+      
+    } else if (n == 5) {
+      252*x^5 - 630*x^4 + 560*x^3 - 210*x^2 + 30*x - 1
+      
+    }
+    
+    # normalisation step
+    sqrt(2*n + 1) * Pn
+  })}
+
+
+# function that computes least-squares coefficients in the normalised shifted Legendre basis up to a given degree
+coefs_shifted_legendre <- function(x, y, degree){
+  
+  X_shifted_legendre <- build_shifted_legendre_basis(x, degree)
+  model <- lm(y ~ X_shifted_legendre - 1)
+  beta <- coef(model)
+  
+  return(beta)}
+
+
+# function that fits a linear model in the normalised shifted Legendre basis and returns the estimated residual variance (sigma^2)
+calculate_sigma2 <- function(x, y, degree){
+  
+  X_poly <- build_shifted_legendre_basis(x, (degree))
+  fitted_model <- lm(y ~ X_poly - 1)
+  
+  return(summary(fitted_model)$sigma^2)
+}
+
+
+# function that computes normalised shifted Legendre basis coefficients for each curve and returns a matrix where each row corresponds to a shape
+# data frame, name of the response variable ("x" or "y"), degree of the polynomial, and vector of shape identifiers (with default being all fully observed curves) to include can be specified
+compute_betas_shifted_legendre <- function(df, variable, degree, shapes = 3:10){
+  
+  # collecting into a list
+  betas_list <- lapply(shapes, function(i) {
+    
+    # selecting response (x or y) from a given data frame
+    y <- df[df$shape == i, variable]
+    
+    # calculating coefficients based on standardised index t (tau)
+    coefs_shifted_legendre(df[df$shape == i, "t_standardised"], y, degree)
+  })
+  
+  do.call(rbind, betas_list)
+}
+
+
+```
+
+# Plotting Functions
+
+This subsection includes functions that will be later used to illustrate the results graphically.
+
+```{r}
+
+# function for plotting reconstructed marginal curves (x or y)
+# both the best estimate and all possible trajectories are plotted
+# it is possible to specify through the parameter "mode" whether to plot trajectories for the whole curve or only for the unknown points, with the former being the default
+summarise_results_1d <- function(predictions, points, true_data, non_observed, response, mode = "full"){
+  
+  # if mode is "full", trajectories will be plotted throughout the curve
+  if(mode == "full"){
+    non_observed <- 1:length(points)
+  }
+  
+  # building a summarising data frame (best estimate)
+  df <- data.frame(
+    best_estimate = apply(predictions, 1, quantile, probs = 0.5))
+  
+  # number of all posterior trajectories
+  n_samples <- ncol(predictions)
+  
+  # building list of all trajectories
+  list_of_trajectories <- lapply(1:n_samples, function(j) {
+    data.frame(
+      sample = j,
+      points = points[non_observed],
+      values = predictions[non_observed, j]
+    )
+  })
+
+  # combining into a single data frame
+  df_trajectories <- do.call(rbind, list_of_trajectories)
+
+  
+  # plotting
+  p <- ggplot() + 
+    geom_line(data = df_trajectories, aes(x = points,y = values, group = sample), colour = "grey50", alpha = 0.05, linewidth = 0.1) + 
+    geom_line(data = df, aes(x = points, y = best_estimate), colour = "black", linewidth = 1) +
+    geom_point(aes(x = points, y = true_data), colour = "red") + labs(x = expression(tau), y = response) + theme_bw()
+  
+  
+  return(p)
+  
+}
+
+
+# function for plotting the reconstructed curve (x, y)
+# both the best estimate and all possible trajectories are plotted
+# it is possible to specify through the parameter "mode" whether to plot trajectories for the whole curve or only for the unknown points, with the former being the default
+summarise_results_2d <- function(predictions_x, predictions_y, 
+                                true_data_x, true_data_y, non_observed, xlim, ylim, mode = "full"){
+  
+  
+  # if mode is "full", trajectories will be plotted throughout the curve
+  if(mode == "full"){
+    non_observed <- 1:nrow(predictions_x)
+  }
+  
+  # building a summarising data frame (best estimate)
+  df_xy <- data.frame(
+  best_estimate_x = apply(predictions_x, 1, quantile, probs = 0.5),
+  best_estimate_y = apply(predictions_y, 1, quantile, probs = 0.5))
+  
+  # number of all posterior trajectories
+  n_samples <- ncol(predictions_x)
+  
+  # building list of all trajectories
+  list_of_trajectories <- lapply(1:n_samples, function(j) {
+    data.frame(
+      sample = j,
+      x = predictions_x[non_observed, j],
+      y = predictions_y[non_observed, j]
+    )
+  })
+  
+
+  # binding into a data frame for plotting
+  df_trajectories <- do.call(rbind, list_of_trajectories)
+  
+  # plotting
+  p <- ggplot() +
+    geom_path(data = df_trajectories, aes(x = x, y = y, group = sample), colour = "grey50", alpha = 0.05, linewidth = 0.1) +
+    geom_path(data = df_xy, aes(x = best_estimate_x, y = best_estimate_y), colour = "black", linewidth = 1.25) +
+    geom_point(aes(x = true_data_x, y = true_data_y), colour = "red", size = 2) +
+    labs(x = NULL, y = NULL) + coord_cartesian(xlim = xlim, ylim = ylim)+ theme_bw()
+  
+  return(p)
+  
+}
+
+################################################################################
+################################################################################
+# the following includes functions for plotting results in case of joint modelling
+
+# function that computes density thresholds defining 2D HPD regions for given probability levels based on kernel density estimation
+# retrieved from https://stackoverflow.com/questions/70569213/two-parameter-bayesian-credibility-interval
+get_hpd2d_levels <- function(x, y, prob=c(0.9,0.95), ...) {
+  post1 <- MASS::kde2d(x, y)
+  dx <- diff(post1$x[1:2])
+  dy <- diff(post1$y[1:2])
+  sz <- sort(post1$z)
+  c1 <- cumsum(sz) * dx * dy
+  ## remove duplicates
+  ## dups <- duplicated(sz)
+  ## sz <- sz[!dups]
+  ## c1 <- c1[!dups]
+  levels <- sapply(prob, function(x) {
+    approx(c1, sz, xout = 1 - x, ties = mean)$y
+  })
+  return(levels)
+}
+
+# function for plotting the reconstructed curve (x, y) in case of joint modelling 
+# credible region and the true data are also portrayed
+# it is possible to specify through the parameter "mode" whether to plot credible region for the whole curve or only for the unknown points, with the latter being the default
+# under joint modelling, x and y are no longer assumed to be independent
+# credible regions are obtained using highest posterior density (HPD) contours from kernel density estimation
+summarise_results_2d_joint <- function(predictions_x, predictions_y, points, 
+                                       true_data_x, true_data_y, non_observed, mode = "only_missing"){
+  
+  # building a summarising data frame (best estimate) for both x and y
+  df_xy <- data.frame(
+    best_estimate_x = apply(predictions_x, 1, quantile, probs = 0.5),
+    best_estimate_y = apply(predictions_y, 1, quantile, probs = 0.5))
+  
+  
+  # if only the missing region is requested, ellipses will be drawn only for that region
+  if(mode == "only_missing"){
+    indices <- non_observed
+  } else{
+    indices <- seq_len(nrow(predictions_x))
+  }
+  
+  # initalising plot
+  p <- ggplot()
+  
+  for(i in indices) {
+    
+    # density threshold corresponding to the 95% HPD region
+    L <- get_hpd2d_levels(predictions_x[i,], predictions_y[i,], prob = 0.95)
+    # kernel density estimation
+    kernel_density <- kde2d(predictions_x[i,], predictions_y[i,])
+    # contour lines at the hpd level
+    cl <- contourLines(kernel_density, levels = L)
+    # combining into data frame for plotting
+    df_contour <- do.call(rbind, lapply(cl, function(c) data.frame(x = c$x, y = c$y)))
+    # plotting 95% credible region for a given point
+    p <- p + geom_polygon(data = df_contour, aes(x = x, y = y), fill = "grey50", alpha = 0.3)
+  }
+  
+  # adding remaining parts(best estimates and existing data)
+  p <- p +
+    geom_path(data = df_xy, aes(x = best_estimate_x, y = best_estimate_y), linewidth = 1.25) +
+    geom_point(aes(x = true_data_x, y = true_data_y), color = "red", size = 2) + 
+    labs(x = NULL, y = NULL) + theme_bw()
+  
+  return(p)
+  
+}
+
+
+################################################################################
+# the following includes functions for plotting results from multiple marginal modelling methods on same figure
+
+# function that constructs a data frame containing marginal model results needed for plotting
+build_df_1d <- function(predictions, points, non_observed, mode = "full", model_name){
+  
+  
+  # if mode is "full", trajectories will be plotted throughout the curve
+  if(mode == "full"){
+    non_observed <- 1:length(points)
+  }
+  
+  # number of all posterior trajectories
+  n_samples <- ncol(predictions)
+  
+  
+  # building list of all trajectories
+  list_of_trajectories <- lapply(1:n_samples, function(j) {
+    data.frame(
+      sample = j,
+      t = points[non_observed],
+      value = predictions[non_observed, j],
+      model = model_name )})
+
+  # binding into a data frame
+  df_trajectories <- do.call(rbind, list_of_trajectories)
+  # unique id
+  df_trajectories$group_id <- paste(model_name, df_trajectories$sample, sep = "_")
+  
+  
+  # best estimate
+  df_best <- data.frame(
+    t = points,
+    best_estimate = apply(predictions, 1, median),
+    model = model_name)
+  
+  
+  # returning both data frames
+  return(list(
+    trajectories = df_trajectories,
+    best = df_best
+  ))
+}
+
+
+
+# function that plots multiple marginal modelling methods on same figure
+plot_1d_models <- function(model_list, points, true_data, non_observed, colors, response, model_order, mode = "full"){
+  
+  # initialising a list for models
+  df_list <- list()
+
+  # looping over models; each time saving the data
+  for(name in model_order){
+    
+    
+    # this will return all trajectories and the best estimates
+    res <- build_df_1d(
+      predictions = model_list[[name]]$predictions,
+      points = points,
+      non_observed = non_observed,
+      mode = mode,
+      model_name = name
+    )
+
+    df_list[[name]] <- res
+  }
+  
+
+  # binding separately
+  # all trajectories from data frame df_trajectories
+  # all best estimates from data frame df_best
+  df_trajectory <- do.call(rbind, lapply(df_list, `[[`, "trajectories"))
+  df_best <- do.call(rbind, lapply(df_list, `[[`, "best"))
+
+  # reorder for plotting
+  df_trajectory$model <- factor(df_trajectory$model, levels = model_order)
+  df_best$model <- factor(df_best$model, levels = model_order)
+
+  # data frame for true data
+  df_true <- data.frame(t = points, y = true_data)
+
+  # plotting
+  p <- ggplot() + 
+    geom_path(data = df_trajectory, aes(x = t, y = value, group = group_id, color = model), 
+    alpha = 0.01, linewidth = 0.1) +
+    geom_path(data = df_best, aes(x = t, y = best_estimate, color = model), linewidth = 1) +
+    geom_point(data = df_true, aes(x = t, y = y), color = "black", size = 1) +
+    scale_color_manual(values = colors) + labs(x = expression(tau), y = response) +
+    guides(color = "none", pattern_colour = "none", pattern_angle = "none") + theme_bw()
+  
+  return(p)
+}
+
+
+################################################################################
+################################################################################
+
+# function that returns a collection of trace plots for each coefficient with the help of gridExtra 
+# exact layout of the plot can be specified
+summarise_trace_plots <- function(beta_samples, plot_rows, plot_cols){
+  
+  # list of ggplot objects
+  p <- ncol(beta_samples)
+  plot_list <- lapply(1:p, function(j){
+  # extracting data for a given coefficient
+  df <- data.frame(
+    number = 1:nrow(beta_samples),
+    values = beta_samples[, j]
+  )
+  # trace plots
+  ggplot(df, aes(x = number, y = values)) +
+    geom_line() +
+    labs(title = NULL, x = bquote(beta[.(j)]), y = "Value") + theme_bw()
+})
+  return(grid.arrange(grobs = plot_list, nrow = plot_rows, ncol = plot_cols))
+  
+}
+
+
+
+```
+
+
+# Modelling
+
+## Determining an Appropriate Prior for $\sigma^2$
+
+In order to set reasonable parameters for the inverse-gamma prior on $\sigma^2$, we estimate the empirical distribution of $\sigma^2$ from fully observed curves and determine the corresponding $\nu_0$ and $\sigma_{0}^2$.
+
+```{r}
+
+# we are interested in finding estimated sigmas for all the fully observed curves of both speakers 
+curves_to_check <- expand.grid(3:10, c(1, 2))
+# initialising data structure to store values
+sigmas <- matrix(NA, nrow = 16, ncol = 2)
+
+for (i in 1:nrow(curves_to_check)) {
+  
+  # selecting combination
+  pair <- curves_to_check[i, ]
+  
+  shape_i <- as.numeric(pair[1])
+  speaker_i <- as.numeric(pair[2])
+  
+  # extracting the data
+  this_curve <- subset(df, df$speaker == speaker_i & df$shape == shape_i)
+  
+  # calculating estimate of sigma^2 for x and y
+  sigmas[i,1] <- calculate_sigma2(this_curve$t_standardised, this_curve$x, 5)
+  sigmas[i,2] <- calculate_sigma2(this_curve$t_standardised, this_curve$y, 4)
+  
+}
+
+
+# finding the gamma parameters for distribution of 1/sigma^2
+gamma <- fitdist(as.vector((1/sigmas)), "gamma", lower=c(0,0))
+shape <- gamma$estimate[1]
+rate <- gamma$estimate[2]
+# as a reference:
+# shape = 1.59865
+# rate = 0.3105013  
+
+# checking the fit graphically
+hist(as.vector((1/sigmas)), probability = TRUE)
+curve(dgamma(x, shape = shape, rate = rate), add = TRUE, col = "red", lwd = 1)
+# => seems reasonable
+  
+# determining parameters for the prior
+nu <- 2 * shape
+sigma2 <- (2*rate) / (nu)
+
+```
+
+## Gibbs Sampling Procedures
+
+The following subsection contains all functions related to Gibbs Sampling.
+
+```{r}
+# global parameters
+default_nu0 <- nu
+default_sigmasq_0 <- sigma2
+default_first_sigma <- 2 # initial sigma^2 in Gibbs Sampling
+
+################################################################################
+
+# function that selects the right number of curves based on the observed data
+# by default, ceiling((degree + 1)/2) best-fitting and floor((degree + 1)/2) worst-fitting curves are selected
+curve_selection <- function(xs, ys, prediction_interval, coefs, number = -1){
+
+  num_select <- number
+  
+  # by default, using the total number of independent polynomials, which corresponds to the number of
+  # columns in the coefficient matrix (degree + 1)
+  if (number <= 0) {
+    num_select <- ncol(coefs)
+  }
+  
+  # determining the missing and observed regions
+  missing_idx = (xs > prediction_interval[1]) & (xs < prediction_interval[2])
+  observed_idx = !missing_idx
+  
+  # filtering out the observed part
+  Y_observed <- ys[observed_idx]
+  
+  # building basis (with normalised shifted Legendre polynomials)
+  X_poly_observed <- build_shifted_legendre_basis(xs[observed_idx], (ncol(coefs)-1))
+  
+  # constructing the design matrix (evaluating the polynomials)
+  X_observed <- t((coefs) %*% t(X_poly_observed))
+  
+  # initialising data structure to store values
+  results <- matrix(NA, nrow = nrow(coefs), ncol = 2)
+  
+  for (i in 1:ncol(X_observed)){
+    
+    # computing similarity (based on squared difference)
+    similarity <- sum((X_observed[,i] - Y_observed)^2)
+    results[i,1] <- i
+    results[i,2] <- similarity
+  }
+  
+  # sorting by similarity in an ascending order
+  results <- results[order(results[,2]), ]
+  
+  # (a %/% b == floor(a/b) for integers)
+  good_number <- num_select %/% 2 + (num_select %% 2 != 0)
+  bad_number  <- num_select %/% 2
+  
+  return(coefs[results[c(1:good_number, (nrow(results) - bad_number):nrow(results)),1], ])
+  
+}
+
+
+# function that performs Gibbs Sampling assuming that required quantities have been precomputed
+Gibbs_core <- function(t, y, shapes_to_fit, prediction_interval,
+                       beta0, Sigma_0, nu0, sigmasq_0,
+                       first_beta, first_sigma, n_simulations = 5000, n_burnin = 100) {
+	
+  
+  num_params <- ncol(shapes_to_fit)
+	n <- length(y)
+	
+	# a vector that has TRUE for all entries that are missing
+	missing_idx <- (t > prediction_interval[1]) & (t < prediction_interval[2])
+	
+	# a vector that has TRUE for all entries that are observed
+	observed_idx <- !missing_idx
+	
+  # selecting only observed part of curve (for both design matrix and response y)
+	observed_shapes <- shapes_to_fit[observed_idx,]
+	y_observed <- y[observed_idx]
+	
+	Sigma0_inv <- solve(Sigma_0) # for later use
+	
+  # initialising data structures to store values
+	beta_samples <- matrix(NA, nrow=(n_simulations + n_burnin), ncol = num_params)
+	sigma2_samples <- numeric((n_simulations + n_burnin))
+	
+  # setting initial values
+	beta_samples[1, ] <- first_beta
+	sigma2_samples[1] <- first_sigma
+	
+	for(iter in 2:(n_simulations + n_burnin)){
+		
+		# UPDATING BETAS
+		
+		# computing covariance matrix
+		V_beta <- solve(t(observed_shapes) %*% observed_shapes / sigma2_samples[iter-1] + Sigma0_inv)
+		# computing mean vector
+		m_beta <- V_beta %*% (t(observed_shapes) %*% y_observed / sigma2_samples[iter-1] + Sigma0_inv %*% beta0)
+		
+		# sampling beta
+		beta_samples[iter, ] <- mvrnorm(1, mu = m_beta, Sigma = V_beta)
+		
+		# UPDATING SIGMA^2
+		
+		# computing SSR
+		SSR <- sum((y_observed - observed_shapes %*% beta_samples[iter, ])^2)
+
+		# computing parameters for inverse gamma
+		shape_sig <- (nu0 + n) / 2
+		rate_sig  <- (nu0 * sigmasq_0 + SSR) / 2
+		
+		# sampling sigma^2
+		sigma2_samples[iter] <- 1 / rgamma(1, shape = shape_sig, rate = rate_sig)
+	}
+	
+  # computing predictions for the full curve
+	predictions <- shapes_to_fit %*% t(beta_samples)
+  
+	# discard first 100
+	return(list(
+		predictions = predictions[,(n_burnin + 1):(n_simulations + n_burnin)],
+		beta_samples = beta_samples[(n_burnin + 1):(n_simulations + n_burnin),]
+    ))
+}
+
+# function that receives coefficients (in normalised shifted Legendre basis) and applies Gibbs Sampling
+# assumes any PCA or curve selection was done beforehand 
+# and the coefficients (coefs) are the final ones to use
+do_Gibbs_1D <- function(t, y, coefs, prediction_interval,
+                        beta0, Sigma_0, nu0, sigmasq_0,
+                        first_beta, first_sigma, n_simulations = 5000){
+  
+  # building basis (with normalised shifted Legendre polynomials)
+  X_poly <- build_shifted_legendre_basis(t, (ncol(coefs)-1))
+  
+  # constructing the design matrix (evaluating the polynomials)
+  X_full <- t((coefs) %*% t(X_poly))
+  
+  # passing things along to the inner function
+  return (Gibbs_core(t, y, X_full, prediction_interval,
+                     beta0, Sigma_0, nu0, sigmasq_0, 
+                     first_beta, first_sigma, n_simulations))
+  
+}
+
+
+# function that receives coefficients (in normalised shifted Legendre basis)
+# for X and Y and applies Gibbs sampling
+# assumes any PCA or curve selection
+# was done beforehand and the coefficients (coefs) are the final ones to use.
+do_Gibbs_2D <- function(t, x, y, coefs_X, coefs_Y, prediction_interval,
+                        beta0, Sigma_0, nu0, sigmasq_0,
+                        first_beta, first_sigma, n_simulations = 5000){
+  
+  # building basis (with normalised shifted Legendre polynomials)
+  X_poly <- build_shifted_legendre_basis(t, (ncol(coefs_X)-1))
+  Y_poly <- build_shifted_legendre_basis(t, (ncol(coefs_Y)-1))
+  
+  
+  # constructing the design matrix (evaluating the polynomials)
+  X_full <- t((coefs_X) %*% t(X_poly))
+  Y_full <- t((coefs_Y) %*% t(Y_poly))
+  
+  # passing things along to the inner function
+  return (Gibbs_core(c(t, t), c(x, y), rbind(X_full, Y_full), prediction_interval,
+                     beta0, Sigma_0, nu0, sigmasq_0, 
+                     first_beta, first_sigma, n_simulations))
+  
+}
+
+
+# function that receives raw coefficients (in normalised shifted Legendre basis),
+# performs curve selection, and applies Gibbs Sampling
+Gibbs_1d_without_PCA <- function(t, y, full_coefs, prediction_interval,
+                                 nu0 = default_nu0, sigmasq_0 = default_sigmasq_0,
+                                 first_sigma = default_first_sigma,
+                                 n_simulations = 5000, curve_select_number = -1) {
+  
+  # performing curve selection
+  coefs <- curve_selection(t, y, prediction_interval, full_coefs, curve_select_number)
+  
+  
+  # passing things along to the inner function
+  return (do_Gibbs_1D(t, y, coefs, prediction_interval,
+                      rep(0.5, nrow(coefs)), diag(1, nrow(coefs)), nu0, sigmasq_0,
+                      rep(1/nrow(coefs), nrow(coefs)), first_sigma, n_simulations))
+}
+
+# function that receives raw coefficients (in normalised shifted Legendre basis),
+# performs PCA, and applies Gibbs Sampling
+Gibbs_1d_PCA <- function(t, y, coefs, prediction_interval,
+                         nu0 = default_nu0, sigmasq_0 = default_sigmasq_0,
+                         first_sigma = default_first_sigma,
+                         n_simulations = 5000) {
+  
+  # building basis (with normalised shifted Legendre polynomials)
+  X_poly <- build_shifted_legendre_basis(t, (ncol(coefs)-1))
+  
+  # finding average curve (P_0)
+  P_0_cs <- colMeans(coefs)
+  
+  # constructing the design matrix (evaluating the polynomials)
+  P_0_real <- X_poly %*% P_0_cs
+  
+  # new response: original response - P_0
+  to_fit <- y - P_0_real
+  
+  # pca
+  pca <- prcomp((coefs), center = TRUE, scale = TRUE)
+  
+  # taking eigenvectors
+  new_coefs <- pca$rotation
+  
+  # Gibbs Sampling procedure
+  res <- do_Gibbs_1D(t, to_fit, new_coefs, prediction_interval,
+                     rep(0, nrow(new_coefs)), diag(1, nrow(new_coefs)), nu0, sigmasq_0,
+                     rep(0, nrow(new_coefs)), first_sigma, n_simulations)
+  
+  # adding back P_0
+  res$predictions <- res$predictions + as.vector(P_0_real)
+  
+  return (res)
+}
+
+# function that receives raw coefficients (in normalised shifted Legendre basis) for X and Y,
+# performs curve selection, and applies Gibbs Sampling
+Gibbs_2d_without_PCA <- function(t, x, y, coefs_X_full, coefs_Y_full, prediction_interval,
+                                 nu0 = default_nu0, sigmasq_0 = default_sigmasq_0,
+                                 first_sigma = default_first_sigma, 
+                                 n_simulations = 5000, curve_select_number = -1) {
+  
+  suggested_num_coefs <- curve_select_number
+  
+  # if the number of curves is not specified,
+  # it selects the right number corresponding to the
+  # dimensionality of the polynomial space
+  if (curve_select_number <= 0) {
+    suggested_num_coefs <- ncol(coefs_X_full) + ncol(coefs_Y_full)
+  }
+  
+  # selecting curves for both x and y
+  coefs_X <- curve_selection(t, x, prediction_interval, coefs_X_full, suggested_num_coefs)
+  coefs_Y <- curve_selection(t, y, prediction_interval, coefs_Y_full, suggested_num_coefs)
+  
+  # passing things along to the inner function
+  return (do_Gibbs_2D(t, x, y, coefs_X, coefs_Y, prediction_interval,
+                      rep(0.5, nrow(coefs_X)), diag(1, nrow(coefs_X)), nu0, sigmasq_0,
+                      rep(1/nrow(coefs_X), nrow(coefs_X)), first_sigma, n_simulations))
+}
+
+
+# function that receives raw coefficients (in normalised shifted Legendre basis) for both X and Y,
+# performs PCA, and applies Gibbs Sampling
+Gibbs_2d_PCA <- function(t, x, y, coefs_X, coefs_Y, prediction_interval,
+                         nu0 = default_nu0, sigmasq_0 = default_sigmasq_0,
+                         first_sigma = default_first_sigma, n_simulations = 5000) {
+  
+  # building basis (with normalised shifted Legendre polynomials)
+  X_poly <- build_shifted_legendre_basis(t, (ncol(coefs_X)-1))
+  Y_poly <- build_shifted_legendre_basis(t, (ncol(coefs_Y)-1))
+
+  # finding average curve (P_0)
+  P_0_cs_X <- colMeans(coefs_X)
+  P_0_cs_Y <- colMeans(coefs_Y)
+  
+  # constructing the design matrix (evaluating the polynomials)
+  P_0_x <- as.vector(X_poly %*% P_0_cs_X)
+  P_0_y <- as.vector(Y_poly %*% P_0_cs_Y)
+  
+  P_0_full <- c(P_0_x, P_0_y)
+  
+  # new response: original response - P_0
+  to_fit_x <- x - P_0_x
+  to_fit_y <- y - P_0_y
+  
+  coefs_XY <- cbind(coefs_X, coefs_Y)
+  
+  # pca
+  pca <- prcomp((coefs_XY), center = TRUE, scale = TRUE)
+  
+  # taking eigenvectors
+  new_coefs <- pca$rotation
+  
+  # Gibbs Sampling procedure
+  res <- do_Gibbs_2D(t, to_fit_x, to_fit_y, 
+                     new_coefs[,1:ncol(coefs_X)], 
+                     new_coefs[,((ncol(coefs_X) + 1):ncol(new_coefs))],
+                     prediction_interval,
+                     rep(0, nrow(new_coefs)), diag(1, nrow(new_coefs)), nu0, sigmasq_0,
+                     rep(0, nrow(new_coefs)), first_sigma, n_simulations)
+  
+  # adding back P_0
+  res$predictions <- res$predictions + P_0_full
+  
+  return (res)
+}
+
+
+  
+```
+
+## Setting up Data Structures
+
+### Computing Coefficients of Polynomials (in normalised shifted Legendre basis)
+
+```{r}
+# DATA STRUCTURES
+
+# setting degrees for x and y
+degree_x <- 5
+degree_y <- 4
+
+# computing shifted Legendre basis coefficients for speakers 1 and 2
+coefs_X_speaker1 <- compute_betas_shifted_legendre(df1, "x", degree_x) # x curves
+coefs_Y_speaker1 <- compute_betas_shifted_legendre(df1, "y", degree_y) # y curves
+coefs_X_speaker2 <- compute_betas_shifted_legendre(df2, "x", degree_x) # x curves
+coefs_Y_speaker2 <- compute_betas_shifted_legendre(df2, "y", degree_y) # y curves
+
+# combining x and y curve coefficients
+coefs_X <- rbind(coefs_X_speaker1, coefs_X_speaker2) # x curves
+coefs_Y <- rbind(coefs_Y_speaker1, coefs_Y_speaker2) # y curves
+```
+
+### Determining Missing Regions
+
+```{r}
+# list of tongue shapes with missing values (first two shapes of both speakers)
+curves_to_check <- list(c(1, 1), c(1, 2), c(2, 1), c(2, 2))
+
+# list of missing regions; each region is described by (tmin, tmax), where t is coordinate along the curve
+missing_regions <- list()
+
+for (c in curves_to_check){
+  
+  # selecting data for a given speaker and curve
+  this_curve <- subset(df, df$speaker == c[1] & df$shape == c[2])
+  
+  # determining the missing section
+  this_missing <- is.na(this_curve$x) | is.na(this_curve$y)
+  
+  # calculating the beginning and the end of the missing sections through the indices t (standardised)
+  this_min <- min(this_curve$t_standardised[this_missing]) - 1/(nrow(this_curve) + 1)
+  this_max <- max(this_curve$t_standardised[this_missing]) + 1/(nrow(this_curve) + 1)
+  
+  missing_regions[[length(missing_regions) + 1]] <- c(this_min, this_max)
+}
+```
+
+
+## Descriptive Overview
+
+The following subsection contains the figures presented in the poster (excluding results which are given later).
+
+### Tongue Shapes of Both Speakers (Figures 1 and 2)
+
+```{r}
+# 2D curves of speaker 1
+ggplot(df1, aes(x = x, y = y)) +
+  geom_point(size = 1) +                       
+  facet_wrap(~shape, ncol = 10) +      
+  coord_fixed() + labs(x = NULL, y = NULL) +                
+  theme_bw()
+
+# 2D curves of speaker 2
+ggplot(df2, aes(x = x, y = y)) +
+  geom_point(size = 1) +                       
+  facet_wrap(~shape, ncol = 10) +      
+  coord_fixed() +  labs(x = NULL, y = NULL) +  
+  theme_bw()
+
+#ggsave("speaker1.png", plot = p1, width = 27, height = 4, units = "cm", dpi = 300)
+#ggsave("speaker2.png", plot = p2, width = 27, height = 4, units = "cm", dpi = 300)
+```
+
+### Curves of x-coordinates (Figure 3)
+
+```{r}
+# grid of points between 0 and 1
+x_grid <- seq(0, 1, length.out = 100)
+degree <- ncol(coefs_X)
+
+# building the shifted legendre basis for the points
+XX_poly <- build_shifted_legendre_basis(x_grid, degree - 1)
+
+# evaluating points
+curves <- as.data.frame(XX_poly %*% t(coefs_X))
+curves$x <- x_grid
+
+# transforming into a long format
+df_long <- curves %>%
+  pivot_longer(cols = -x, names_to = "curve", values_to = "y") %>%
+  mutate(
+    curve       = as.integer(gsub("V", "", curve)),     # number of the curve
+    color_group = ((curve - 1) %% 8) + 1,               # determining colour
+    lty_group   = ifelse(curve <= 8, "solid", "dashed") # style
+  )
+
+# plotting
+base_colors <- rainbow(8)
+p1 <- ggplot(df_long, aes(x = x, y = y, group = curve)) +
+  geom_line(aes(color = factor(color_group), linetype = lty_group), linewidth = 0.5) +
+  scale_color_manual(values = setNames(base_colors, as.character(1:8)), guide = "none") +
+  scale_linetype_manual(values = c("solid" = 1, "dashed" = 2), guide = "none") +
+  labs(x = expression(tau), y = "x") + theme_bw()
+
+################################################################################
+# save
+#ggsave("curves_x.png", plot = p1, width = 9.75, height = 6.7, units = "cm", dpi = 300)
+
+```
+
+### Curves of y Coordinates (Figure 3)
+
+```{r}
+# grid of points between 0 and 1
+y_grid <- seq(0, 1, length.out = 100)
+degree <- ncol(coefs_Y)
+
+# building the shifted legendre basis for the points
+Y_poly <- build_shifted_legendre_basis(y_grid, degree - 1)
+
+# evaluating points
+curves <- as.data.frame(Y_poly %*% t(coefs_Y))
+curves$x <- y_grid
+
+# transforming into a long format
+df_long <- curves %>%
+  pivot_longer(cols = -x, names_to = "curve", values_to = "y") %>%
+  mutate(
+    curve       = as.integer(gsub("V", "", curve)),     # number of the curve
+    color_group = ((curve - 1) %% 8) + 1,               # determining colour
+    lty_group   = ifelse(curve <= 8, "solid", "dashed") # style
+  )
+
+# plotting
+base_colors <- rainbow(8)
+p1 <- ggplot(df_long, aes(x = x, y = y, group = curve)) +
+  geom_line(aes(color = factor(color_group), linetype = lty_group), linewidth = 0.5) +
+  scale_color_manual(values = setNames(base_colors, as.character(1:8)), guide = "none") +
+  scale_linetype_manual(values = c("solid" = 1, "dashed" = 2), guide = "none") +
+  labs(x = expression(tau), y = "y") + theme_bw()
+
+################################################################################
+# save
+#ggsave("curves_y.png", plot = p1, width = 9.75, height = 6.7, units = "cm", dpi = 300)
+
+```
+
+
+## Results
+
+The following subsection contains results of all four methods.
+
+### Preliminary Step
+
+```{r}
+
+# finding row indices corresponding to missing regions (needed for plotting)
+curves_to_check <- list(c(1, 1), c(1, 2), c(2, 1), c(2, 2))
+
+regions <- list()
+i <- 1
+
+for (c in curves_to_check){
+  
+  # selecting data for a given speaker and curve
+  this_curve <- subset(df, df$speaker == c[1] & df$shape == c[2])
+  
+  # determining the missing interval
+  regions[[i]] <- which(
+             this_curve$t_standardised > missing_regions[[i]][1] & 
+             this_curve$t_standardised < missing_regions[[i]][2])
+  
+  i <- i + 1
+  
+  }
+
+# storing results:
+# region 1 corresponds to speaker 1, curve 1
+# region 2 corresponds to speaker 1, curve 2
+# region 3 corresponds to speaker 2, curve 1
+# region 4 corresponds to speaker 2, curve 2
+region_1 <- regions[[1]]
+region_2 <- regions[[2]]
+region_3 <- regions[[3]]
+region_4 <- regions[[4]]
+```
+
+
+### Speaker 1, Curve 1
+
+```{r}
+
+set.seed(123)
+################################################################################
+
+# marginal modelling; with PCA
+speaker_1_shape_1_x_PCA <- Gibbs_1d_PCA(subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$x, coefs_X, missing_regions[[1]])
+speaker_1_shape_1_y_PCA <- Gibbs_1d_PCA(subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$y, coefs_Y, missing_regions[[1]])
+
+# x curve
+summarise_results_1d(speaker_1_shape_1_x_PCA$predictions, subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$x, region_1, "x")
+# y curve
+summarise_results_1d(speaker_1_shape_1_y_PCA$predictions, subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$y, region_1, "y")
+# together (x,y)
+p1 <- summarise_results_2d(speaker_1_shape_1_x_PCA$predictions, speaker_1_shape_1_y_PCA$predictions, subset(df1, shape == 1)$x, subset(df1, shape == 1)$y, region_1, c(10,50), c(35,65))
+
+################################################################################
+
+# marginal modelling; without PCA
+speaker_1_shape_1_x_without_PCA <- Gibbs_1d_without_PCA(subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$x, coefs_X, missing_regions[[1]])
+speaker_1_shape_1_y_without_PCA <- Gibbs_1d_without_PCA(subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$y, coefs_Y, missing_regions[[1]])
+
+# x curve
+summarise_results_1d(speaker_1_shape_1_x_without_PCA$predictions, subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$x, region_1, "x")
+# y curve
+summarise_results_1d(speaker_1_shape_1_y_without_PCA$predictions, subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$y, region_1,  "y")
+# together (x,y)
+p2 <- summarise_results_2d(speaker_1_shape_1_x_without_PCA$predictions, speaker_1_shape_1_y_without_PCA$predictions, subset(df1, shape == 1)$x, subset(df1, shape == 1)$y, region_1, c(10,50), c(35,65))
+
+################################################################################
+
+# joint modelling; with PCA
+speaker1_curve1_PCA <- Gibbs_2d_PCA(subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$x, subset(df1, shape == 1)$y, coefs_X, coefs_Y, missing_regions[[1]])
+
+# together (x,y)
+p3 <- summarise_results_2d(speaker1_curve1_PCA$predictions[1:65,], speaker1_curve1_PCA$predictions[66:130,], subset(df1, shape == 1)$x, subset(df1, shape == 1)$y, region_1, c(10,50), c(35,65))
+
+################################################################################
+
+# joint modelling; without PCA
+speaker1_curve1_without_PCA <- Gibbs_2d_without_PCA(subset(df1, shape == 1)$t_standardised, subset(df1, shape == 1)$x, subset(df1, shape == 1)$y, coefs_X, coefs_Y, missing_regions[[1]], 5000)
+
+# together (x,y)
+p4 <- summarise_results_2d(speaker1_curve1_without_PCA$predictions[1:65,], speaker1_curve1_without_PCA$predictions[66:130,], subset(df1, shape == 1)$x, subset(df1, shape == 1)$y, region_1, c(10,50), c(35,65))
+
+################################################################################
+# save
+ggsave("speaker1_curve1_1d_pca.png", plot = p1, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker1_curve1_1d_withoutpca.png", plot = p2, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker1_curve1_2d_pca.png", plot = p3, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker1_curve1_2d_withoutpca.png", plot = p4, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+
+```
+
+### Speaker 1, Curve 2
+
+```{r}
+set.seed(123)
+################################################################################
+
+# marginal modelling; with PCA
+speaker_1_shape_2_x_PCA <- Gibbs_1d_PCA(subset(df1, shape == 2)$t_standardised, subset(df1, shape == 2)$x, coefs_X, missing_regions[[2]])
+speaker_1_shape_2_y_PCA <- Gibbs_1d_PCA(subset(df1, shape == 2)$t_standardised, subset(df1, shape == 2)$y, coefs_Y, missing_regions[[2]])
+
+# x curve
+summarise_results_1d(speaker_1_shape_2_x_PCA$predictions, subset(df1, shape == 2)$t_standardised, subset(df1, shape == 2)$x, region_2, "x")
+# y curve
+summarise_results_1d(speaker_1_shape_2_y_PCA$predictions, 1:65, subset(df1, shape == 2)$y, region_2, "y")
+# together (x,y)
+p1 <- summarise_results_2d(speaker_1_shape_2_x_PCA$predictions, speaker_1_shape_2_y_PCA$predictions, subset(df1, shape == 2)$x, subset(df1, shape == 2)$y, region_2, c(15,47), c(35,65))
+
+################################################################################
+
+# marginal modelling; without PCA
+speaker_1_shape_2_x_without_PCA <- Gibbs_1d_without_PCA(subset(df1, shape == 2)$t_standardised, subset(df1, shape == 2)$x, coefs_X, missing_regions[[2]])
+speaker_1_shape_2_y_without_PCA <- Gibbs_1d_without_PCA(subset(df1, shape == 2)$t_standardised, subset(df1, shape == 2)$y, coefs_Y, missing_regions[[2]])
+
+# x curve
+summarise_results_1d(speaker_1_shape_2_x_without_PCA$predictions, subset(df1, shape == 2)$t_standardised, subset(df1, shape == 2)$x, region_2, "x")
+# y curve
+summarise_results_1d(speaker_1_shape_2_y_without_PCA$predictions, subset(df1, shape == 2)$t_standardised, subset(df1, shape == 2)$y, region_2, "y")
+# together (x,y)
+p2 <- summarise_results_2d(speaker_1_shape_2_x_without_PCA$predictions, speaker_1_shape_2_y_without_PCA$predictions, subset(df1, shape == 2)$x, subset(df1, shape == 2)$y, region_2, c(15,47), c(35,65))
+
+################################################################################
+
+# joint modelling; with PCA
+speaker1_curve2_PCA <- Gibbs_2d_PCA(subset(df1, shape == 2)$t_standardised, subset(df1, shape == 2)$x, subset(df1, shape == 2)$y, coefs_X, coefs_Y, missing_regions[[2]])
+
+# together (x,y)
+p3 <- summarise_results_2d(speaker1_curve2_PCA$predictions[1:65,], speaker1_curve2_PCA$predictions[66:130,], subset(df1, shape == 2)$x, subset(df1, shape == 2)$y, region_2, c(15,47), c(35,65))
+
+################################################################################
+
+# joint modelling; without PCA
+speaker1_curve2_without_PCA <- Gibbs_2d_without_PCA(subset(df1, shape == 2)$t_standardised, subset(df1, shape == 2)$x, subset(df1, shape == 2)$y, coefs_X, coefs_Y, missing_regions[[2]])
+
+# together (x,y)
+p4 <- summarise_results_2d(speaker1_curve2_without_PCA$predictions[1:65,], speaker1_curve2_without_PCA$predictions[66:130,], subset(df1, shape == 2)$x, subset(df1, shape == 2)$y, region_2, c(15,47), c(35,65))
+
+################################################################################
+# save
+ggsave("speaker1_curve2_1d_pca.png", plot = p1, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker1_curve2_1d_withoutpca.png", plot = p2, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker1_curve2_2d_pca.png", plot = p3, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker1_curve2_2d_withoutpca.png", plot = p4, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+
+```
+
+
+###  Speaker 2, Curve 1
+
+```{r}
+set.seed(123)
+################################################################################
+
+# marginal modelling; with PCA
+speaker_2_shape_1_x_PCA <- Gibbs_1d_PCA(subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$x, coefs_X, missing_regions[[3]])
+speaker_2_shape_1_y_PCA <- Gibbs_1d_PCA(subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$y, coefs_Y, missing_regions[[3]])
+
+# x curve
+summarise_results_1d(speaker_2_shape_1_x_PCA$predictions, subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$x, region_3, "x")
+# y curve
+summarise_results_1d(speaker_2_shape_1_y_PCA$predictions, subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$y, region_3, "y")
+# together (x,y)
+p1 <- summarise_results_2d(speaker_2_shape_1_x_PCA$predictions, speaker_2_shape_1_y_PCA$predictions, subset(df2, shape == 1)$x, subset(df2, shape == 1)$y, region_3, c(12,50), c(30,65))
+
+################################################################################
+
+# marginal modelling; without PCA
+speaker_2_shape_1_x_without_PCA <- Gibbs_1d_without_PCA(subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$x, coefs_X, missing_regions[[3]])
+speaker_2_shape_1_y_without_PCA <- Gibbs_1d_without_PCA(subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$y, coefs_Y, missing_regions[[3]])
+
+# x curve
+summarise_results_1d(speaker_2_shape_1_x_without_PCA$predictions, subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$x, region_3, "x")
+# y curve
+summarise_results_1d(speaker_2_shape_1_y_without_PCA$predictions, subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$y, region_3, "y")
+# together (x,y)
+p2 <- summarise_results_2d(speaker_2_shape_1_x_without_PCA$predictions, speaker_2_shape_1_y_without_PCA$predictions, subset(df2, shape == 1)$x, subset(df2, shape == 1)$y, region_3, c(12,50), c(30,65))
+
+################################################################################
+
+# joint modelling; with PCA
+speaker2_curve1_PCA <- Gibbs_2d_PCA(subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$x, subset(df2, shape == 1)$y, coefs_X, coefs_Y, missing_regions[[3]])
+
+# together (x,y)
+p3 <- summarise_results_2d(speaker2_curve1_PCA$predictions[1:45,], speaker2_curve1_PCA$predictions[46:90,], subset(df2, shape == 1)$x, subset(df2, shape == 1)$y, region_3, c(12,50), c(30,65))
+
+################################################################################
+
+# joint modelling; without PCA
+speaker2_curve1_without_PCA <- Gibbs_2d_without_PCA(subset(df2, shape == 1)$t_standardised, subset(df2, shape == 1)$x, subset(df2, shape == 1)$y, coefs_X, coefs_Y, missing_regions[[3]])
+
+# together (x,y)
+p4 <- summarise_results_2d(speaker2_curve1_without_PCA$predictions[1:45,], speaker2_curve1_without_PCA$predictions[46:90,], subset(df2, shape == 1)$x, subset(df2, shape == 1)$y, region_3, c(12,50), c(30,65))
+
+################################################################################
+# save
+ggsave("speaker2_curve1_1d_pca.png", plot = p1, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker2_curve1_1d_withoutpca.png", plot = p2, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker2_curve1_2d_pca.png", plot = p3, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker2_curve1_2d_withoutpca.png", plot = p4, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+
+
+```
+
+
+### Speaker 2, Curve 2
+
+```{r}
+set.seed(123)
+################################################################################
+
+# marginal modelling; with PCA
+speaker_2_shape_2_x_PCA <- Gibbs_1d_PCA(subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$x, coefs_X, missing_regions[[4]])
+speaker_2_shape_2_y_PCA <- Gibbs_1d_PCA(subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$y, coefs_Y, missing_regions[[4]])
+
+# x curve
+summarise_results_1d(speaker_2_shape_2_x_PCA$predictions, subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$x, region_4, "x")
+# y curve
+summarise_results_1d(speaker_2_shape_2_y_PCA$predictions, subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$y, region_4, "y")
+# together (x,y)
+p1 <- summarise_results_2d(speaker_2_shape_2_x_PCA$predictions, speaker_2_shape_2_y_PCA$predictions, subset(df2, shape == 2)$x, subset(df2, shape == 2)$y, region_4, c(13,40), c(47,65))
+
+################################################################################
+
+# marginal modelling; without PCA
+speaker_2_shape_2_x_without_PCA <- Gibbs_1d_without_PCA(subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$x, coefs_X, missing_regions[[4]])
+speaker_2_shape_2_y_without_PCA <- Gibbs_1d_without_PCA(subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$y, coefs_Y, missing_regions[[4]])
+
+# x curve
+summarise_results_1d(speaker_2_shape_2_x_without_PCA$predictions, subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$x, region_4, "x")
+# y curve
+summarise_results_1d(speaker_2_shape_2_y_without_PCA$predictions, subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$y, region_4, "y")
+# together (x,y)
+p2 <- summarise_results_2d(speaker_2_shape_2_x_without_PCA$predictions, speaker_2_shape_2_y_without_PCA$predictions, subset(df2, shape == 2)$x, subset(df2, shape == 2)$y, region_4, c(13,40), c(47,65))
+
+################################################################################
+
+# joint modelling; with PCA
+speaker2_curve2_PCA <- Gibbs_2d_PCA(subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$x, subset(df2, shape == 2)$y, coefs_X, coefs_Y, missing_regions[[4]])
+
+# together (x,y)
+p3 <- summarise_results_2d(speaker2_curve2_PCA$predictions[1:45,], speaker2_curve2_PCA$predictions[46:90,], subset(df2, shape == 2)$x, subset(df2, shape == 2)$y, region_4, c(13,40), c(47,65))
+
+################################################################################
+
+# joint modelling; without PCA
+speaker2_curve2_without_PCA <- Gibbs_2d_without_PCA(subset(df2, shape == 2)$t_standardised, subset(df2, shape == 2)$x, subset(df2, shape == 2)$y, coefs_X, coefs_Y, missing_regions[[4]])
+
+# together (x,y)
+p4 <- summarise_results_2d(speaker2_curve2_without_PCA$predictions[1:45,], speaker2_curve2_without_PCA$predictions[46:90,], subset(df2, shape == 2)$x, subset(df2, shape == 2)$y, region_4, c(13,40), c(47,65))
+
+################################################################################
+# save
+ggsave("speaker2_curve2_1d_pca.png", plot = p1, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker2_curve2_1d_withoutpca.png", plot = p2, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker2_curve2_2d_pca.png", plot = p3, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+ggsave("speaker2_curve2_2d_withoutpca.png", plot = p4, width = 10.7, height = 7.7, units = "cm", dpi = 300)
+
+
+
+```
+
+
+### Comparison of PCA vs non-PCA in Marginal Modelling (Figure 5)
+
+```{r}
+#model_order <- c("No PCA", "PCA")
+model_order <- c("PCA", "No PCA")
+
+
+# speaker 1; curve 1; x curve
+p1 <- plot_1d_models(
+      model_list = list(
+     "No PCA" = speaker_1_shape_1_x_without_PCA,
+     "PCA" = speaker_1_shape_1_x_PCA), subset(df1, shape == 1)$t_standardised, 
+     subset(df1, shape == 1)$x, region_1,
+     colors = c("No PCA" = "red", "PCA" = "blue"), response = "x", model_order)
+
+# speaker 1; curve 1; y curve
+p2 <- plot_1d_models(
+     model_list = list(
+    "No PCA" = speaker_1_shape_1_y_without_PCA,
+    "PCA" = speaker_1_shape_1_y_PCA), subset(df1, shape == 1)$t_standardised, 
+     subset(df1, shape == 1)$y, region_1,
+     colors = c("No PCA" = "red", "PCA" = "blue"), response = "y", model_order)
+
+################################################################################
+# save
+ggsave("marginal_x.png", plot = p1, width = 9.75, height = 6.7, units = "cm", dpi = 300)
+ggsave("marginal_y.png", plot = p2, width = 9.75, height = 6.7, units = "cm", dpi = 300)
+
+
+```
+
+
+### Model Comparison
+
+
+The following subsection contains code for model comparison and all relevant parts that were used for summarising the results, as presented on the poster.
+
+
+#### Finding Average Error for Each Region and Model (Figure 7)
+
+```{r}
+set.seed(123)
+
+################################################################################
+# helper functions 
+
+# function that computes the sum of absolute errors between predictions 
+# and true points over the interval of interest
+calculate_SSR <- function(predictions, true, to_be_predicted){
+  
+  best_estimate <- apply(predictions, 1, quantile, probs = 0.5)[to_be_predicted]
+  true <- true[to_be_predicted]
+  SSR <- sum(abs(best_estimate - true))
+  
+  return((SSR))
+}
+
+# function that computes errors for all four methods for a given curve and missing region
+error <- function(coefs_X, coefs_Y, t_standardised, true_x, true_y, missing_region){
+  
+  n <- length(true_x)
+  
+  # with PCA
+  x_PCA <- Gibbs_1d_PCA(t_standardised, true_x, coefs_X, missing_region)
+  y_PCA <- Gibbs_1d_PCA(t_standardised, true_y, coefs_Y, missing_region)
+  xy_2d_PCA <- Gibbs_2d_PCA(t_standardised, true_x, true_y, coefs_X, coefs_Y, missing_region)
+  
+  # without PCA
+  x_no_PCA <- Gibbs_1d_without_PCA(t_standardised, true_x, coefs_X, missing_region)
+  y_no_PCA <- Gibbs_1d_without_PCA(t_standardised, true_y, coefs_Y, missing_region)
+  xy_2d_no_PCA <- Gibbs_2d_without_PCA(t_standardised, true_x, true_y, coefs_X, coefs_Y, missing_region)
+  
+  # determining points over which the error is computed
+  to_be_predicted <- (t_standardised > missing_region[1]) & (t_standardised < missing_region[2])
+  
+  # computing errors for each method; x and y parts are done separately
+  m1 <- calculate_SSR(x_PCA$predictions, true_x, to_be_predicted) + calculate_SSR(y_PCA$predictions, true_y, to_be_predicted)
+  
+  m2 <- calculate_SSR(x_no_PCA$predictions, true_x, to_be_predicted) + calculate_SSR(y_no_PCA$predictions, true_y, to_be_predicted)
+  
+  m3 <- calculate_SSR(xy_2d_PCA$predictions[1:n,], true_x, to_be_predicted) + calculate_SSR(xy_2d_PCA$predictions[(n+1):(2*n),], true_y, to_be_predicted)
+  
+   m4 <- calculate_SSR(xy_2d_no_PCA$predictions[1:n,], true_x, to_be_predicted) + calculate_SSR(xy_2d_no_PCA$predictions[(n+1):(2*n),], true_y, to_be_predicted)
+   
+   return(c((m1), (m2), (m3), (m4)))
+}
+
+################################################################################
+################################################################################
+
+# all pairs of (shape, speaker) used in model comparison (all fully observed tongue shapes)
+curves_to_fit <- expand.grid(3:10, 1:2)
+n_coefs_per_speaker <- 8
+n_ignored_curves <- 2
+n_methods <- 4
+
+# initialising data structure to store results
+diagnostic_results <- matrix(NA, nrow = nrow(curves_to_fit), ncol = n_methods * length(missing_regions))
+
+for (i in 1:nrow(curves_to_fit)) {
+  
+  this_shape <- curves_to_fit[i, 1]
+  this_speaker <- curves_to_fit[i, 2]
+  
+  this_coef <- n_coefs_per_speaker * (this_speaker - 1) + (this_shape - n_ignored_curves)
+  
+  # indices such that the coefficients of a given shape used for error computation are excluded 
+  # in order to avoid leakage
+  selected_coefs <- (1:nrow(coefs_X))[-this_coef]
+  
+  # extracting true data for a given shape
+  this_curve <- subset(df, df$speaker == this_speaker & df$shape == this_shape)
+  
+  # computing errors
+  for (j in 1:length(missing_regions)) {
+  
+    
+    results <- error(coefs_X[selected_coefs,], coefs_Y[selected_coefs,],
+                     this_curve$t_standardised, this_curve$x, this_curve$y,
+                     missing_regions[[j]])
+    
+    
+    diagnostic_results[i, (1 + (j-1) * length(results)):(j* length(results))] <- results
+  }
+}
+
+
+# in order to have comparable values between speaker 1 and 2, dividing by the number of points
+normalised_res <- rbind(diagnostic_results[1:8,] / 65 , diagnostic_results[9:16,] / 45)
+
+################################################################################
+# BUILDING TABLE OF RESULTS
+
+# mapping of methods based on original table
+col_map <- list(
+  "1" = c(1,5,9,13),
+  "2" = c(2,6,10,14),
+  "3" = c(3,7,11,15),
+  "4" = c(4,8,12,16))
+
+models <- 1:4
+methods_table <- list()
+
+for (m in models) {
+  
+  # selecting model
+  columns <- col_map[[m]]
+  # extracting corresponding chunk
+  this_res <- normalised_res[, columns]
+  # taking transpose: rows = regions, columns = curves
+  this_res <- t(this_res)
+  
+  # convert to data frame
+  df_this_res <- as.data.frame(this_res)
+  
+  # average per region for each model
+  # (taking all points into account)
+  df_this_res$region_average <- (colSums(diagnostic_results[, columns])/(8 * 65 + 8 * 45))
+  
+  # label for region
+  df_this_res$missing_region <- rep(1:4)
+  
+  # label for model
+  model_names <- c("Marginal PCA", "Marginal without PCA", "Joint PCA", "Joint without PCA")
+  df_this_res$model <- model_names[m]
+  
+  methods_table[[m]] <- df_this_res
+}
+
+# combining all rows
+results_per_method <- do.call(rbind, methods_table)
+# computing mean per model (across all regions)
+model_means <- aggregate(region_average ~ model, results_per_method, mean)
+# correct order (because aggregate does not keep the right order)
+correct_order <- c("Marginal PCA", "Marginal without PCA", "Joint PCA", "Joint without PCA")
+model_means <- model_means[match(correct_order, model_means$model), ]
+
+# adding mean to dataframe
+results_per_method$model_average <- rep(model_means$region_average, each = 4)
+# rounding
+numeric_columns <- sapply(results_per_method, is.numeric)
+results_per_method[numeric_columns] <- round(results_per_method[numeric_columns], 2)
+# results (move model and missing region to the beginning)
+final_table <- results_per_method[, c("model", "missing_region", setdiff(names(results_per_method), c("model", "missing_region")))]
+
+# save
+#write.csv(final_table, "final.csv", row.names = FALSE)
+
+################################################################################
+# CREATING A PLOT
+
+final_table$missing_region <- as.factor(final_table$missing_region)
+# to ensure right order
+final_table$model <- factor(final_table$model,
+                     levels = c("Marginal without PCA", "Joint without PCA", "Joint PCA", "Marginal PCA"))
+
+# plot (log scale)
+final <- ggplot(final_table, aes(x = model, y = region_average, fill = missing_region)) +
+geom_errorbar(aes(ymin = model_average, ymax = model_average), 
+              linewidth = 0.8, width = 0.9, position = "identity", linetype = "dashed") +
+ geom_col(position = position_dodge(width = 0.85), width = 0.75, alpha = 1) +
+  scale_fill_manual(values = c("darkred", "darkblue", "darkgreen", "darkgoldenrod"))+
+  labs(x = "Model", y = "Absolute Error", fill = "Missing Region")  + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(size = 13), 
+        legend.text = element_text(size = 13),
+        legend.title = element_text(size = 13))
+
+# save
+ggsave("final2.png", plot = final, width = 25, height = 16, units = "cm", dpi = 300)
+################################################################################
+
+```
+
+#### Finding Point-Wise Errors for Each Region and Model (Figure 6)
+
+```{r}
+set.seed(123)
+
+################################################################################
+# helper functions 
+
+# function that computes the absolute errors between predictions 
+# and true points over the interval of interest
+calculate_pointwise_error <- function(predictions, true, to_be_predicted){
+  
+  best_estimate <- apply(predictions, 1, quantile, probs = 0.5)
+  
+  errors <- abs(best_estimate - true)
+  
+  return((errors[to_be_predicted]))
+}
+
+# function that computes point-wise errors for all four methods for a given curve and missing region
+error2 <- function(coefs_X, coefs_Y, t_standardised,
+                  true_x, true_y, missing_region){
+  
+  n <- length(true_x)
+  
+  # with PCA; marginal modelling
+  x_PCA <- Gibbs_1d_PCA(t_standardised, true_x, coefs_X, missing_region)
+  y_PCA <- Gibbs_1d_PCA(t_standardised, true_y, coefs_Y, missing_region)
+  
+  # without PCA, marginal modelling
+  x_no_PCA <- Gibbs_1d_without_PCA(t_standardised, true_x, coefs_X, missing_region)
+  y_no_PCA <- Gibbs_1d_without_PCA(t_standardised, true_y, coefs_Y, missing_region)
+  
+  # with PCA; joint modelling
+  xy_2d_PCA <- Gibbs_2d_PCA(t_standardised, true_x, true_y, coefs_X, coefs_Y, missing_region)
+  
+  # without PCA; joint modelling
+  xy_2d_no_PCA <- Gibbs_2d_without_PCA(t_standardised, true_x, true_y, coefs_X, coefs_Y, missing_region)
+  
+  # determining points over which the error is computed
+  to_be_predicted <- (t_standardised > missing_region[1]) &
+    (t_standardised < missing_region[2])
+  
+  # computing errors for each method; x and y parts are done separately
+  m1_x <- calculate_pointwise_error(x_PCA$predictions, true_x, to_be_predicted)
+  m1_y <- calculate_pointwise_error(y_PCA$predictions, true_y, to_be_predicted)
+  
+  m2_x <- calculate_pointwise_error(x_no_PCA$predictions, true_x, to_be_predicted)
+  m2_y <- calculate_pointwise_error(y_no_PCA$predictions, true_y, to_be_predicted)
+  
+  m3_x <- calculate_pointwise_error(xy_2d_PCA$predictions[1:n,], true_x, to_be_predicted)
+  m3_y <- calculate_pointwise_error(xy_2d_PCA$predictions[(n+1):(2*n),], true_y, to_be_predicted)
+  
+  m4_x <- calculate_pointwise_error(xy_2d_no_PCA$predictions[1:n,], true_x, to_be_predicted)
+  m4_y <- calculate_pointwise_error(xy_2d_no_PCA$predictions[(n+1):(2*n),], true_y, to_be_predicted)
+  
+  # returning a list of results; x and y parts are summed element-wise
+  list(
+    m1 = (m1_x + m1_y),
+    m2 = (m2_x + m2_y),
+    m3 = (m3_x + m3_y),
+    m4 = (m4_x + m4_y)
+  )
+}
+
+################################################################################
+################################################################################
+
+# all pairs of (shape, speaker) used in model comparison (all fully observed tongue shapes)
+curves_to_fit <- expand.grid(3:10, 1:2)
+n_coefs_per_speaker <- 8
+n_ignored_curves <- 2
+n_methods <- 4
+
+# initialising list to store results
+diagnostic_results2 <- list()
+for (i in 1:4) {
+  diagnostic_results2[[i]] <- list(c(), c(), c(), c())
+}
+
+
+
+for (i in 1:nrow(curves_to_fit)) {
+  
+  this_shape <- curves_to_fit[i, 1]
+  this_speaker <- curves_to_fit[i, 2]
+  
+  this_coef <- n_coefs_per_speaker * (this_speaker - 1) + (this_shape - n_ignored_curves)
+  
+  # indices such that the coefficients of a given shape used for error computation are excluded 
+  # in order to avoid leakage
+  selected_coefs <- (1:nrow(coefs_X))[-this_coef]
+  
+  # extracting true data for a given shape
+  this_curve <- subset(df, df$speaker == this_speaker & df$shape == this_shape)
+  
+  # computing errors
+  for (j in 1:length(missing_regions)) {
+    
+
+    results <- error2(coefs_X[selected_coefs,], coefs_Y[selected_coefs,],
+                     this_curve$t_standardised, this_curve$x, this_curve$y,
+                     missing_regions[[j]])
+    
+    
+    for (k in 1:length(results)) {
+      diagnostic_results2[[j]][[k]] <- c(diagnostic_results2[[j]][[k]], results[[k]])
+    }
+    
+  }
+}
+
+
+################################################################################
+# PLOTS
+
+# function that plots errors for a given model
+# number of bins can be specified to ensure all plots are on comparable scale in the end
+summarise_point_wise_errors <- function(method, diagnostic_results2, region_names, nr_of_bins){
+  
+  # data for all 4 regions
+  df_hist_region <- data.frame(
+  value = unlist(lapply(1:4, function(j) diagnostic_results2[[j]][[method]])),
+  Region = rep(region_names, times = sapply(1:4, function(j) length(diagnostic_results2[[j]][[method]]))))
+
+  # plotting
+  p <- ggplot(df_hist_region, aes(x = value, fill = Region)) +
+  geom_histogram(position = "stack", bins = nr_of_bins) +
+  scale_fill_manual(values = c("darkred", "darkblue", "darkgreen", "darkgoldenrod")) +
+  labs(x = NULL, y = NULL)  + coord_cartesian(xlim = c(0, 48), ylim = c(0,125)) +
+  scale_x_continuous(expand = c(0.01, 0)) +
+  theme_bw() + theme(legend.position = "none")
+  
+  return(p)
+  
+}
+
+# list of regions
+region_names <- c("1", "2", "3", "4")
+
+# plots
+p1 <- summarise_point_wise_errors(1, diagnostic_results2, region_names, 50)
+p2 <- summarise_point_wise_errors(2, diagnostic_results2, region_names, 140)
+p3 <- summarise_point_wise_errors(3, diagnostic_results2, region_names, 50)
+p4 <- summarise_point_wise_errors(4, diagnostic_results2, region_names, 100)
+
+
+
+# save
+ggsave("errors_pca_marginal.png", plot = p1, width = 15, height = 8, units = "cm", dpi = 300)
+ggsave("errors_withoutpca_marginal.png", plot = p2, width = 15, height = 8, units = "cm", dpi = 300)
+ggsave("errors_pca_joint.png", plot = p3, width = 15, height = 8, units = "cm", dpi = 300)
+ggsave("errors_withoutpca_joint.png", plot = p4, width = 15, height = 8, units = "cm", dpi = 300)
+```
+
+
+
