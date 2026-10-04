@@ -9,4 +9,4 @@ sizes of relevant factors on weight. To better assess age and gender-specific pa
 
 ## Thesis
 
-The full thesis is available [here](katrin_kulberg_bsc_2024.pdf). It is also available through the [official repository of the University of Tartu](https://dspace.ut.ee/items/e6dcbe87-b6c2-40d3-944d-218b181b5f1d).
+The full thesis is available through the [official repository of the University of Tartu](https://dspace.ut.ee/items/e6dcbe87-b6c2-40d3-944d-218b181b5f1d).
