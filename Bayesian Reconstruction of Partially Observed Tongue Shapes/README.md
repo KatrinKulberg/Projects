@@ -10,5 +10,5 @@ The work considers modelling the partially observed curves as a linear combinati
 
 The project is available in the form of a poster [here](Poster.pdf).
 
-The R Markdown code is available [here](Bayesian%20Reconstruction%20of%20Partially%20Observed%20Tongue%20Shapes.Rmd).
+The R Markdown code is available [here](Bayesian%20Reconstruction%20of%20Partially%20Observed%20Tongue%20Shapes.Rmd). The data are not available.
 
